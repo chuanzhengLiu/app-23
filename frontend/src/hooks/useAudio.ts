@@ -1,9 +1,14 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useLocalStorage } from './useLocalStorage';
 
 interface UseAudioProps {
   src: string;
-  id: string; // Used for persistence key
+  id: string;
+}
+
+export interface LoopRange {
+  start: number;
+  end: number;
 }
 
 export const useAudio = ({ src, id }: UseAudioProps) => {
@@ -13,12 +18,18 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [playbackRate, setPlaybackRateState] = useState(1.0);
+  const [loopRange, setLoopRangeState] = useState<LoopRange | null>(null);
   
-  // Persist Volume (Global)
   const [volume, setVolume] = useLocalStorage<number>('audio-volume', 1.0);
   
-  // Ref to track if we need to save progress when ID changes
   const progressRef = useRef(0);
+  const loopRangeRef = useRef<LoopRange | null>(null);
+  const pendingSeekRef = useRef<{ time: number; range?: LoopRange | null } | null>(null);
+
+  useEffect(() => {
+    loopRangeRef.current = loopRange;
+  }, [loopRange]);
 
   useEffect(() => {
     // When ID changes, we need to load the saved time for the NEW ID.
@@ -40,8 +51,10 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
 
     const audio = new Audio(src);
     audioRef.current = audio;
-    audio.volume = volume; // Apply global volume
+    audio.volume = volume;
+    audio.playbackRate = playbackRate;
     setLoading(true);
+    setLoopRangeState(null);
 
     // Retrieve saved time just once per ID change
     // We cannot use useLocalStorage hook directly here because the key is dynamic 
@@ -60,7 +73,20 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     const setAudioData = () => {
       setDuration(audio.duration);
       setLoading(false);
-      // Resume if valid and not finished
+
+      if (pendingSeekRef.current) {
+        const { time, range } = pendingSeekRef.current;
+        pendingSeekRef.current = null;
+        const safeTime = Math.max(0, Math.min(time, audio.duration - 0.1));
+        audio.currentTime = safeTime;
+        setCurrentTime(safeTime);
+        if (range) {
+          setLoopRangeState(range);
+          loopRangeRef.current = range;
+        }
+        return;
+      }
+
       if (savedTime > 0 && savedTime < audio.duration - 2) { 
          audio.currentTime = savedTime;
          setCurrentTime(savedTime);
@@ -72,12 +98,10 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
       setCurrentTime(curr);
       progressRef.current = curr;
       
-      // Save periodically (e.g. every 2 seconds is handled by the UI/event loop naturally via timeupdate)
-      // Writing to localStorage on every frame (timeupdate fires frequently) is bad. 
-      // Let's debounce or just save on pause/destruct. 
-      // Actually, standard practice for simple apps: save on pause/unmount is better for performance, 
-      // but riskier if crash. Let's do a simple check to save every ~5s or just on pause.
-      // For this app, let's stick to saving on UNMOUNT or ID CHANGE (cleanup) + PAUSE.
+      const range = loopRangeRef.current;
+      if (range && curr >= range.end) {
+        audio.currentTime = range.start;
+      }
     };
 
     const onEnded = () => {
@@ -181,6 +205,54 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
       setVolume(clamped);
   };
 
+  const setPlaybackRate = useCallback((rate: number) => {
+    setPlaybackRateState(rate);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = rate;
+    }
+  }, []);
+
+  const setLoopRange = useCallback((range: LoopRange | null) => {
+    setLoopRangeState(range);
+  }, []);
+
+  const waitForReady = useCallback((): Promise<void> => {
+    return new Promise((resolve) => {
+      const audio = audioRef.current;
+      if (!audio || !src) {
+        resolve();
+        return;
+      }
+      if (audio.readyState >= 1 && !isNaN(audio.duration)) {
+        resolve();
+        return;
+      }
+      const handleReady = () => {
+        audio.removeEventListener('loadedmetadata', handleReady);
+        resolve();
+      };
+      audio.addEventListener('loadedmetadata', handleReady);
+    });
+  }, [src]);
+
+  const seekAndLoop = useCallback(async (time: number, range?: LoopRange | null) => {
+    const audio = audioRef.current;
+    if (!audio || !src) return;
+
+    if (audio.readyState < 1 || isNaN(audio.duration)) {
+      pendingSeekRef.current = { time, range };
+      return;
+    }
+
+    const safeTime = Math.max(0, Math.min(time, audio.duration - 0.1));
+    audio.currentTime = safeTime;
+    setCurrentTime(safeTime);
+    if (range) {
+      setLoopRangeState(range);
+      loopRangeRef.current = range;
+    }
+  }, [src]);
+
   return {
     playing,
     currentTime,
@@ -191,5 +263,12 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     changeVolume,
     error,
     loading,
+    playbackRate,
+    setPlaybackRate,
+    loopRange,
+    setLoopRange,
+    waitForReady,
+    seekAndLoop,
+    audioRef,
   };
 };
