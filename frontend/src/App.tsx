@@ -1,9 +1,11 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useAudio } from './hooks/useAudio';
 import { useSearch } from './hooks/useSearch';
 import { useFavorites } from './hooks/useFavorites';
 import { useLocalStorage } from './hooks/useLocalStorage';
+import { useSentenceFavorites } from './hooks/useSentenceFavorites';
 import { parseLRC, LrcLine } from './utils/lrcParser';
+import { SavedSentence } from './utils/db';
 
 import { Lyrics } from './components/Lyrics';
 import { Player } from './components/Player';
@@ -11,6 +13,7 @@ import { SearchBar } from './components/SearchBar';
 import { UploadZone } from './components/UploadZone';
 import { CategoryTabs } from './components/CategoryTabs';
 import { FavoriteButton } from './components/FavoriteButton';
+import { SentenceList } from './components/SentenceList';
 import { ChevronDown, ListMusic } from 'lucide-react'; // Import icons
 
 interface Lesson {
@@ -34,11 +37,25 @@ function AppImproved() {
   // --- Hooks ---
   const { favorites, toggleFavorite, isFavorite } = useFavorites();
   const { setQuery, filteredItems: searchResults } = useSearch(lessons);
+  const {
+    sentences: savedSentences,
+    isSentenceFavorite,
+    toggleSentence: toggleSentenceFavorite,
+    removeSentence: removeSentenceFavorite,
+  } = useSentenceFavorites();
+
+  // --- Intensive Listening Mode ---
+  const [intensiveMode, setIntensiveMode] = useLocalStorage<boolean>('intensive-mode', false);
+
+  // Pending "review sentence" request: when reviewing a saved sentence from a
+  // different lesson, the audio element is rebuilt asynchronously, so we stash
+  // the target region here and apply it once the new audio is ready.
+  const pendingReviewRef = useRef<{ lessonId: string; start: number; end: number } | null>(null);
 
   // --- Filtering Logic ---
   const categories = useMemo(() => {
      const cats = new Set(lessons.map(l => l.category).filter(Boolean));
-     return ['全部', '收藏', ...Array.from(cats)];
+     return ['全部', '收藏', '难句', ...Array.from(cats)];
   }, [lessons]);
 
   const displayedLessons = useMemo(() => {
@@ -57,16 +74,21 @@ function AppImproved() {
   const currentLesson = lessons.find(l => l.id === currentLessonId);
   const audioSrc = currentLesson?.audioUrl || '';
   
-  const { 
-      playing, 
-      currentTime, 
-      duration, 
-      togglePlay, 
-      seek, 
-      volume, 
-      changeVolume, 
-      error, 
-      loading 
+  const {
+      playing,
+      currentTime,
+      duration,
+      togglePlay,
+      seek,
+      volume,
+      changeVolume,
+      error,
+      loading,
+      playbackRate,
+      changePlaybackRate,
+      loopRegion,
+      setLoopRegion,
+      clearLoopRegion,
   } = useAudio({
     src: audioSrc,
     id: currentLessonId
@@ -168,6 +190,67 @@ function AppImproved() {
       setIsPlayerExpanded(true);
   };
 
+  // --- Intensive Listening Handlers ---
+  const handleLineLoop = (line: LrcLine, _index: number, end: number) => {
+      setLoopRegion({ start: line.time, end });
+      // Auto-play when entering loop
+      if (!playing) togglePlay();
+  };
+
+  const handleRangeLoop = (_startIdx: number, _endIdx: number, start: number, end: number) => {
+      setLoopRegion({ start, end });
+      if (!playing) togglePlay();
+  };
+
+  const handleToggleSentenceFavorite = (line: LrcLine, _index: number, end: number) => {
+      if (!currentLesson) return;
+      toggleSentenceFavorite({
+          lessonId: currentLesson.id,
+          lessonTitle: currentLesson.title,
+          text: line.text,
+          start: line.time,
+          end,
+      });
+  };
+
+  const handleReviewSentence = (s: SavedSentence) => {
+      // Switch to lesson if not already, enable intensive mode and apply loop region.
+      const isSameLesson = currentLessonId === s.lessonId;
+      setIntensiveMode(true);
+      setSelectedCategory('全部');
+      setIsPlayerExpanded(true);
+
+      if (isSameLesson) {
+          // Audio for this lesson is already mounted; apply immediately.
+          setLoopRegion({ start: s.start, end: s.end });
+          seek(s.start);
+          return;
+      }
+
+      // Different lesson: defer the seek + setLoopRegion until the new audio
+      // element has finished loading metadata (otherwise the calls would land
+      // on the previous audio instance and silently fail).
+      pendingReviewRef.current = { lessonId: s.lessonId, start: s.start, end: s.end };
+      setCurrentLessonId(s.lessonId);
+  };
+
+  // Apply a deferred "review difficult sentence" once the target audio is ready.
+  // Signals: currentLessonId matches the pending lesson, audio is no longer
+  // loading, and duration > 0 (set in the loadedmetadata handler).
+  useEffect(() => {
+      const pending = pendingReviewRef.current;
+      if (!pending) return;
+      if (currentLessonId !== pending.lessonId) return;
+      if (loading || duration <= 0) return;
+      // Clamp to avoid out-of-range seeks if the saved sentence references a time
+      // beyond the current audio's duration (e.g. file replaced).
+      const start = Math.max(0, Math.min(pending.start, duration - 0.05));
+      const end = Math.max(start + 0.05, Math.min(pending.end, duration));
+      pendingReviewRef.current = null;
+      setLoopRegion({ start, end });
+      seek(start);
+  }, [currentLessonId, duration, loading, setLoopRegion, seek]);
+
   // --- Render ---
   return (
     <div className={`h-full min-h-screen transition-colors duration-300 ${isDarkMode ? 'dark bg-gray-900 text-white' : 'bg-gray-50 text-gray-900'} font-sans`}>
@@ -209,7 +292,13 @@ function AppImproved() {
                  {/* Upload Zone */}
                  {selectedCategory === '全部' && <UploadZone onUpload={handleUpload} />}
 
-                 {displayedLessons.length === 0 ? (
+                 {selectedCategory === '难句' ? (
+                     <SentenceList
+                       sentences={savedSentences}
+                       onReview={handleReviewSentence}
+                       onRemove={removeSentenceFavorite}
+                     />
+                 ) : displayedLessons.length === 0 ? (
                      <div className="text-center py-10 text-gray-400">没有找到相关课程</div>
                  ) : (
                      displayedLessons.map(l => (
@@ -275,20 +364,37 @@ function AppImproved() {
              {/* Lyrics Area - Taking up most space */}
              <div className="flex-1 overflow-hidden relative w-full">
                  <div className="absolute inset-0 bg-gradient-to-b from-gray-50 via-transparent to-gray-50 dark:from-gray-900 dark:to-gray-900 opacity-10 pointer-events-none z-10"></div>
-                 <Lyrics lines={lyrics} currentTime={currentTime}/>
+                 <Lyrics
+                     lines={lyrics}
+                     currentTime={currentTime}
+                     intensiveMode={intensiveMode}
+                     duration={duration}
+                     loopRegion={loopRegion}
+                     onLineLoop={handleLineLoop}
+                     onRangeLoop={handleRangeLoop}
+                     onToggleSentenceFavorite={handleToggleSentenceFavorite}
+                     isSentenceFavorite={(start) => !!currentLesson && isSentenceFavorite(currentLesson.id, start)}
+                 />
              </div>
 
              {/* Bottom Controls */}
              <div className="flex-none p-6 bg-white dark:bg-gray-900 border-t border-gray-200 dark:border-gray-800">
-                 <Player 
-                     playing={playing} 
-                     currentTime={currentTime} 
-                     duration={duration} 
-                     onTogglePlay={togglePlay} 
+                 <Player
+                     playing={playing}
+                     currentTime={currentTime}
+                     duration={duration}
+                     onTogglePlay={togglePlay}
                      onSeek={seek}
                      title={currentLesson?.title || ''}
                      volume={volume}
                      onVolumeChange={changeVolume}
+                     intensiveMode={intensiveMode}
+                     onToggleIntensiveMode={() => setIntensiveMode(!intensiveMode)}
+                     playbackRate={playbackRate}
+                     onPlaybackRateChange={changePlaybackRate}
+                     loopRegion={loopRegion}
+                     onClearLoopRegion={clearLoopRegion}
+                     onLoopRegionChange={setLoopRegion}
                  />
              </div>
           </div>
@@ -363,20 +469,37 @@ function AppImproved() {
                  {/* Lyrics (Scrollable Middle) */}
                  <div className="flex-1 overflow-hidden relative my-4 mask-image-gradient">
                      <div className="absolute inset-0 bg-gradient-to-b from-white via-transparent to-white dark:from-gray-900 dark:to-gray-900 opacity-20 pointer-events-none z-10"></div>
-                     <Lyrics lines={lyrics} currentTime={currentTime}/>
+                     <Lyrics
+                         lines={lyrics}
+                         currentTime={currentTime}
+                         intensiveMode={intensiveMode}
+                         duration={duration}
+                         loopRegion={loopRegion}
+                         onLineLoop={handleLineLoop}
+                         onRangeLoop={handleRangeLoop}
+                         onToggleSentenceFavorite={handleToggleSentenceFavorite}
+                         isSentenceFavorite={(start) => !!currentLesson && isSentenceFavorite(currentLesson.id, start)}
+                     />
                  </div>
 
                  {/* Bottom Controls */}
                  <div className="flex-none pb-8 bg-white dark:bg-gray-900 px-2">
-                     <Player 
-                         playing={playing} 
-                         currentTime={currentTime} 
-                         duration={duration} 
-                         onTogglePlay={togglePlay} 
+                     <Player
+                         playing={playing}
+                         currentTime={currentTime}
+                         duration={duration}
+                         onTogglePlay={togglePlay}
                          onSeek={seek}
                          title={currentLesson?.title || ''}
                          volume={volume}
                          onVolumeChange={changeVolume}
+                         intensiveMode={intensiveMode}
+                         onToggleIntensiveMode={() => setIntensiveMode(!intensiveMode)}
+                         playbackRate={playbackRate}
+                         onPlaybackRateChange={changePlaybackRate}
+                         loopRegion={loopRegion}
+                         onClearLoopRegion={clearLoopRegion}
+                         onLoopRegionChange={setLoopRegion}
                      />
                  </div>
               </div>

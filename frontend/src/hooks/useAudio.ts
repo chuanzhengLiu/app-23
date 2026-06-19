@@ -1,5 +1,10 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useLocalStorage } from './useLocalStorage';
+
+export interface LoopRegion {
+  start: number;
+  end: number;
+}
 
 interface UseAudioProps {
   src: string;
@@ -13,10 +18,22 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  
+
   // Persist Volume (Global)
   const [volume, setVolume] = useLocalStorage<number>('audio-volume', 1.0);
-  
+  // Persist playback rate (Global) - intensive listening speed control
+  const [playbackRate, setPlaybackRate] = useLocalStorage<number>('audio-rate', 1.0);
+
+  // AB loop region for intensive listening. null = no loop.
+  const [loopRegion, setLoopRegionState] = useState<LoopRegion | null>(null);
+  const loopRegionRef = useRef<LoopRegion | null>(null);
+  // Debounce loop-jump so timeupdate firing right at the boundary doesn't cause flicker.
+  const lastLoopJumpRef = useRef<number>(0);
+  // Small lead time so the loop wraps slightly before the exact end, avoiding
+  // boundary jitter (e.g. timeupdate fires past `end` repeatedly while seeking).
+  const LOOP_LEAD_TIME = 0.05; // seconds
+  const LOOP_JUMP_COOLDOWN_MS = 250;
+
   // Ref to track if we need to save progress when ID changes
   const progressRef = useRef(0);
 
@@ -29,7 +46,13 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     setPlaying(false);
     setError(null);
     setLoading(false);
-    
+
+    // Switching to a new audio source: drop any AB loop region from the previous
+    // lesson so it doesn't accidentally jump around in the new audio.
+    setLoopRegionState(null);
+    loopRegionRef.current = null;
+    lastLoopJumpRef.current = 0;
+
     // Cleanup old audio
     if (audioRef.current) {
         audioRef.current.pause();
@@ -41,6 +64,7 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     const audio = new Audio(src);
     audioRef.current = audio;
     audio.volume = volume; // Apply global volume
+    audio.playbackRate = playbackRate; // Apply persisted playback rate
     setLoading(true);
 
     // Retrieve saved time just once per ID change
@@ -69,6 +93,29 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
 
     const setAudioTime = () => {
       const curr = audio.currentTime;
+
+      // Intensive listening: AB loop. Wrap a little BEFORE `end` (LOOP_LEAD_TIME)
+      // so the boundary doesn't flicker when timeupdate fires multiple times
+      // very close to end. A short cooldown also prevents double-jumps if the
+      // browser fires timeupdate again right after we re-seek to start.
+      const region = loopRegionRef.current;
+      if (region && region.end > region.start) {
+        const threshold = Math.max(region.start + 0.01, region.end - LOOP_LEAD_TIME);
+        const now = Date.now();
+        if (curr >= threshold && now - lastLoopJumpRef.current > LOOP_JUMP_COOLDOWN_MS) {
+          lastLoopJumpRef.current = now;
+          audio.currentTime = region.start;
+          setCurrentTime(region.start);
+          progressRef.current = region.start;
+          return;
+        }
+        // While in the cooldown window after a jump, ignore timeupdate values
+        // that are still past the end (rare but happens on some browsers).
+        if (curr >= region.end && now - lastLoopJumpRef.current <= LOOP_JUMP_COOLDOWN_MS) {
+          return;
+        }
+      }
+
       setCurrentTime(curr);
       progressRef.current = curr;
       
@@ -152,6 +199,19 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     }
   }, [volume]);
 
+  // Handle Playback Rate Changes
+  useEffect(() => {
+    if (audioRef.current) {
+        audioRef.current.playbackRate = playbackRate;
+    }
+  }, [playbackRate]);
+
+  // Keep loopRegion ref in sync so the timeupdate listener (registered once per src/id)
+  // can read the latest value without needing to re-bind.
+  useEffect(() => {
+    loopRegionRef.current = loopRegion;
+  }, [loopRegion]);
+
   const togglePlay = async () => {
     const audio = audioRef.current;
     if (!audio || !src || error) return;
@@ -181,6 +241,35 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
       setVolume(clamped);
   };
 
+  const changePlaybackRate = useCallback((rate: number) => {
+      // Clamp to reasonable bounds matching intensive listening presets (0.5x ~ 1.5x)
+      const clamped = Math.max(0.5, Math.min(1.5, rate));
+      setPlaybackRate(clamped);
+  }, [setPlaybackRate]);
+
+  const setLoopRegion = useCallback((region: LoopRegion | null) => {
+      // Reset cooldown so the first wrap after a (re)set works immediately.
+      lastLoopJumpRef.current = 0;
+      if (!region) {
+          setLoopRegionState(null);
+          return;
+      }
+      const start = Math.max(0, region.start);
+      const end = Math.max(start + 0.05, region.end);
+      setLoopRegionState({ start, end });
+      // If currently outside region, jump to start so loop kicks in immediately.
+      const audio = audioRef.current;
+      if (audio && (audio.currentTime < start || audio.currentTime >= end)) {
+          audio.currentTime = start;
+          setCurrentTime(start);
+      }
+  }, []);
+
+  const clearLoopRegion = useCallback(() => {
+      lastLoopJumpRef.current = 0;
+      setLoopRegionState(null);
+  }, []);
+
   return {
     playing,
     currentTime,
@@ -191,5 +280,10 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     changeVolume,
     error,
     loading,
+    playbackRate,
+    changePlaybackRate,
+    loopRegion,
+    setLoopRegion,
+    clearLoopRegion,
   };
 };
