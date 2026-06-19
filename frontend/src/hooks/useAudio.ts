@@ -1,9 +1,20 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useLocalStorage } from './useLocalStorage';
 
 interface UseAudioProps {
   src: string;
-  id: string; // Used for persistence key
+  id: string;
+}
+
+interface LoopRange {
+  start: number;
+  end: number;
+}
+
+interface PendingAction {
+  seekTo?: number;
+  loopRange?: LoopRange;
+  play?: boolean;
 }
 
 export const useAudio = ({ src, id }: UseAudioProps) => {
@@ -13,24 +24,84 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [playbackRate, setPlaybackRateState] = useState(1);
+  const [loopRange, setLoopRangeState] = useState<LoopRange | null>(null);
+  const [isReady, setIsReady] = useState(false);
   
-  // Persist Volume (Global)
   const [volume, setVolume] = useLocalStorage<number>('audio-volume', 1.0);
   
-  // Ref to track if we need to save progress when ID changes
   const progressRef = useRef(0);
+  const loopRangeRef = useRef<LoopRange | null>(null);
+  const playbackRateRef = useRef(1);
+  const pendingActionRef = useRef<PendingAction | null>(null);
+
+  const executePendingAction = useCallback((audio: HTMLAudioElement) => {
+    const action = pendingActionRef.current;
+    if (!action) return;
+    pendingActionRef.current = null;
+
+    if (action.seekTo !== undefined) {
+      audio.currentTime = action.seekTo;
+      setCurrentTime(action.seekTo);
+    }
+    if (action.loopRange) {
+      loopRangeRef.current = action.loopRange;
+      setLoopRangeState(action.loopRange);
+    }
+    if (action.play) {
+      audio.play().catch(err => console.error("Delayed play failed:", err));
+    }
+  }, []);
+
+  const playFrom = useCallback((time: number, range?: LoopRange) => {
+    const audio = audioRef.current;
+    if (!audio || !src || error) return;
+
+    if (audio.readyState >= 2 && !loading) {
+      if (range) {
+        loopRangeRef.current = range;
+        setLoopRangeState(range);
+      }
+      audio.currentTime = time;
+      setCurrentTime(time);
+      audio.play().catch(err => console.error("Play failed:", err));
+    } else {
+      pendingActionRef.current = { seekTo: time, loopRange: range, play: true };
+      setLoading(true);
+    }
+  }, [src, error, loading]);
+
+  const clearLoop = useCallback(() => {
+    loopRangeRef.current = null;
+    setLoopRangeState(null);
+  }, []);
+
+  const setLoop = useCallback((start: number, end: number) => {
+    const clampedStart = Math.max(0, start);
+    const clampedEnd = Math.min(duration || Infinity, end);
+    if (clampedStart >= clampedEnd) return;
+    const range = { start: clampedStart, end: clampedEnd };
+    loopRangeRef.current = range;
+    setLoopRangeState(range);
+  }, [duration]);
+
+  const setPlaybackRate = useCallback((rate: number) => {
+    const clamped = Math.max(0.5, Math.min(1.5, rate));
+    playbackRateRef.current = clamped;
+    setPlaybackRateState(clamped);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = clamped;
+    }
+  }, []);
 
   useEffect(() => {
-    // When ID changes, we need to load the saved time for the NEW ID.
-    // The previous ID's progress is saved continuously or on pause, 
-    // but strict isolation means we define usage: `progress-${id}`.
-    
-    // Reset transient state
     setPlaying(false);
     setError(null);
     setLoading(false);
+    setIsReady(false);
+    clearLoop();
+    pendingActionRef.current = null;
     
-    // Cleanup old audio
     if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current.src = "";
@@ -40,28 +111,24 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
 
     const audio = new Audio(src);
     audioRef.current = audio;
-    audio.volume = volume; // Apply global volume
+    audio.volume = volume;
+    audio.playbackRate = playbackRateRef.current;
     setLoading(true);
-
-    // Retrieve saved time just once per ID change
-    // We cannot use useLocalStorage hook directly here because the key is dynamic 
-    // and hooks cannot be called conditionally or in loops/callbacks easily if the key swaps.
-    // Instead, we read localStorage manually for the dynamic ID or rely on the parent to pass valid initial state?
-    // Actually, reading localStorage manually in useEffect is safe for this dynamic key behavior.
     
     let savedTime = 0;
     try {
         const saved = window.localStorage.getItem(`progress-${id}`);
         if (saved) savedTime = parseFloat(saved);
-        // Safety check: ignore completed or near-completed (e.g. > 95%)? 
-        // For listening apps, usually we want to resume unless it was literally finished.
     } catch (e) { console.warn("Failed to read saved progress", e); }
 
     const setAudioData = () => {
       setDuration(audio.duration);
       setLoading(false);
-      // Resume if valid and not finished
-      if (savedTime > 0 && savedTime < audio.duration - 2) { 
+      setIsReady(true);
+      
+      if (pendingActionRef.current) {
+        executePendingAction(audio);
+      } else if (savedTime > 0 && savedTime < audio.duration - 2) { 
          audio.currentTime = savedTime;
          setCurrentTime(savedTime);
       }
@@ -72,26 +139,34 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
       setCurrentTime(curr);
       progressRef.current = curr;
       
-      // Save periodically (e.g. every 2 seconds is handled by the UI/event loop naturally via timeupdate)
-      // Writing to localStorage on every frame (timeupdate fires frequently) is bad. 
-      // Let's debounce or just save on pause/destruct. 
-      // Actually, standard practice for simple apps: save on pause/unmount is better for performance, 
-      // but riskier if crash. Let's do a simple check to save every ~5s or just on pause.
-      // For this app, let's stick to saving on UNMOUNT or ID CHANGE (cleanup) + PAUSE.
+      const loop = loopRangeRef.current;
+      if (loop && curr >= loop.end) {
+        audio.currentTime = loop.start;
+        setCurrentTime(loop.start);
+      }
     };
 
     const onEnded = () => {
-      setPlaying(false);
-      setCurrentTime(0);
-      try {
-        window.localStorage.removeItem(`progress-${id}`);
-      } catch (e) {}
+      const loop = loopRangeRef.current;
+      if (loop) {
+        audio.currentTime = loop.start;
+        setCurrentTime(loop.start);
+        audio.play().catch(() => {});
+      } else {
+        setPlaying(false);
+        setCurrentTime(0);
+        try {
+          window.localStorage.removeItem(`progress-${id}`);
+        } catch (e) {}
+      }
     };
 
     const onError = (e: Event) => {
       console.warn("Audio error event:", e);
       setLoading(false);
+      setIsReady(false);
       setPlaying(false);
+      pendingActionRef.current = null;
       
       const errCode = audio.error?.code;
       const errMsg = audio.error?.message;
@@ -109,7 +184,6 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
 
     const onPause = () => {
         setPlaying(false);
-        // Save progress on pause
         try {
             window.localStorage.setItem(`progress-${id}`, audio.currentTime.toString());
         } catch (e) {}
@@ -120,6 +194,13 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     };
 
     audio.addEventListener('loadedmetadata', setAudioData);
+    audio.addEventListener('canplay', () => {
+      setLoading(false);
+      setIsReady(true);
+      if (pendingActionRef.current) {
+        executePendingAction(audio);
+      }
+    });
     audio.addEventListener('timeupdate', setAudioTime);
     audio.addEventListener('ended', onEnded);
     audio.addEventListener('error', onError);
@@ -127,7 +208,6 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     audio.addEventListener('play', onPlay);
 
     return () => {
-      // Cleanup: Save progress for the OLD id before we switch or unmount
       if (audio.currentTime > 0) {
           try {
              window.localStorage.setItem(`progress-${id}`, audio.currentTime.toString());
@@ -143,9 +223,8 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
       audio.removeEventListener('play', onPlay);
       audio.src = "";
     };
-  }, [src, id]); // Re-run when source or ID changes
+  }, [src, id, clearLoop, executePendingAction]);
 
-  // Handle Volume Changes
   useEffect(() => {
     if (audioRef.current) {
         audioRef.current.volume = volume;
@@ -170,7 +249,10 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
   const seek = (time: number) => {
     const audio = audioRef.current;
     if (!audio || !src || error) return;
-    if (audio.readyState === 0) return; 
+    if (audio.readyState === 0) {
+      pendingActionRef.current = { ...pendingActionRef.current, seekTo: time };
+      return;
+    }
     
     audio.currentTime = time;
     setCurrentTime(time);
@@ -182,6 +264,7 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
   };
 
   return {
+    audioRef,
     playing,
     currentTime,
     duration,
@@ -191,5 +274,12 @@ export const useAudio = ({ src, id }: UseAudioProps) => {
     changeVolume,
     error,
     loading,
+    playbackRate,
+    setPlaybackRate,
+    loopRange,
+    setLoop,
+    clearLoop,
+    isReady,
+    playFrom,
   };
 };
