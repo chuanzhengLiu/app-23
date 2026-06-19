@@ -9,7 +9,18 @@ export interface SavedLesson {
   createdAt: number;
 }
 
+export interface SavedSentence {
+  id: string;          // Unique id: `${lessonId}_${time}` so the same sentence is not duplicated
+  lessonId: string;
+  lessonTitle: string;
+  text: string;
+  start: number;       // Start time in seconds
+  end: number;         // End time in seconds
+  createdAt: number;
+}
+
 const STORE_PREFIX = 'lesson_';
+const SENTENCE_PREFIX = 'sentence_';
 
 export const saveLocalLesson = async (lesson: { id: string; title: string; category: string }, audio: File, lrc?: File) => {
   const data: SavedLesson = {
@@ -42,4 +53,21 @@ export const loadLocalLessons = async () => {
 
 export const deleteLocalLesson = async (id: string) => {
     await del(STORE_PREFIX + id);
+};
+
+export const saveSentence = async (sentence: SavedSentence) => {
+    await set(SENTENCE_PREFIX + sentence.id, sentence);
+};
+
+export const deleteSentence = async (id: string) => {
+    await del(SENTENCE_PREFIX + id);
+};
+
+export const loadSentences = async (): Promise<SavedSentence[]> => {
+    const allKeys = await keys();
+    const sentenceKeys = allKeys.filter(k => typeof k === 'string' && k.startsWith(SENTENCE_PREFIX));
+    const sentences = await Promise.all(sentenceKeys.map(k => get<SavedSentence>(k)));
+    return sentences
+        .filter((s): s is SavedSentence => !!s)
+        .sort((a, b) => b.createdAt - a.createdAt);
 };
